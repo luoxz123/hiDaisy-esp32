@@ -1,312 +1,397 @@
-# HiLily ESP32 设备端固件 (HiLily Device Firmware)
+# HiDaisy ESP32 终端固件
 
-> **HiLily** — 用 AI 温暖每一段晚年时光。
-> 本仓库为 HiLily 智能陪伴设备的硬件端 (ESP32) 固件代码，采用 FreeRTOS + C++ 架构开发。
+> HiDaisy / HiLily AI 智能陪伴设备的 ESP32-S3 固件。
 
-**[English Documentation → README.md](README.md)**
+**[English README](README.md)** · **[终端项目报告](docs/HILILY_TERMINAL_PROJECT_REPORT.md)** · **[英文用户手册](USER_MANUAL_EN.md)**
 
----
+## 项目概述
 
-## 核心产品愿景与架构路线
+本仓库包含 HiDaisy 智能陪伴终端的设备侧固件，产品主要面向老年用户。ESP32-S3 负责实时音频采集与播放、本地唤醒、显示和物理按键、Wi-Fi 配网、设备激活、提醒、电池监控和 OTA。语音识别、对话推理、内容服务和语音合成运行在服务端。
 
-### 现状与挑战
+当前主链路使用 HTTP 完成注册和鉴权，使用 MQTT 传输 JSON 控制信令，使用加密 UDP 传输低延迟 Opus 音频。旧 WebSocket 客户端仍保留在源码中供参考，但没有进入当前硬件构建。
 
-当前业界的主流方案多为"语音 → 文本 → 大模型 → 文本 → 语音"的级联架构 (Cascade Pipeline)。这导致硬件端必须等待服务端完成一系列串行处理，网络 I/O 的叠加极易突破 500ms 的拟真交互延迟极限。
+```text
+INMP441 麦克风
+  -> I2S 采集 -> ESP-SR AEC + 降噪
+  -> 本地 Daisy microWakeWord / Opus 编码
+  -> AES-CTR UDP 音频 -> HiDaisy 服务端
+  -> ASR -> 对话 / 工具 -> TTS
+  -> UDP Opus -> 抗抖队列 -> I2S -> MAX98357A 扬声器
 
-### 我们的目标
-
-HiLily 的终极目标是实现**极低延迟、全双工、拟真自然**的语音对讲。面向独居老人用户群体，我们紧跟前沿技术（如 **GPT-4o Realtime**），积极探索**端到端原生多模态大模型 (E2E Audio-in/Audio-out)**，旨在跳过文本的编解码损耗，直接用音频流驱动情绪与对话。
-
-### 未来方向：声学情绪感知
-
-当前的情绪识别依赖文本 — LLM 从转录内容推断情感状态。我们的路线图目标是**声学情绪感知**，使 HiLily 能够：
-
-- 检测**呻吟声或呼救声** — 独居老人可能的疼痛或不适信号
-- 识别**声音颤抖或不稳定** — 焦虑、恐惧或身体虚弱的指标
-- 感知**说话节奏与能量的变化** — 疲劳、激动或突发困境的迹象
-
-这些声学信号对人类听者来说显而易见，但在资源受限的 ESP32 硬件上实现仍具挑战性。我们正在探索轻量级端侧模型（如基于 CNN 的 MFCC 分类器或量化 TinyML 模型）与服务端韵律分析的混合方案。
-
-### 硬件架构设计原则
-
-在原生端到端大模型完全成熟前，本固件配合 Server 端基于 **MQTT + UDP + Opus (AES-CTR 加密)** 的通信架构运行：
-
-- **极简数据流**: 硬件端不做复杂音频语义识别，仅作为麦克风采集推流器与喇叭播放器
-- **ESP-SR 音频前处理 (AFE)**: NSNet2 神经网络降噪 + VAD 语音活动检测 + WakeNet9 唤醒词检测
-- **Always-on 麦克风**: 常开麦克风持续喂入 AFE，支持随时唤醒 ("嗨莉莉") 和实时 VAD 检测
-- **MQTT 信令通道**: JSON 控制信令（hello 握手、listen/stop/interrupt 等）通过 MQTT 传输
-- **UDP 音频通道**: Opus 编码音频通过 UDP 加密传输，低延迟、低开销
-- **全双工打断 (Barge-in)**: 本地高优先级 GPIO 监听 + Jitter Buffer，随时丢弃残余音频并向服务端发送打断指令
-
----
-
-## 技术栈与硬件
-
-| 项目 | 详情 |
-|------|------|
-| **主控芯片** | ESP32-S3-N16R8 (双核 240MHz, 16MB Flash, 8MB PSRAM) |
-| **操作系统** | FreeRTOS |
-| **开发框架** | ESP-IDF v5.x |
-| **语言** | C++ |
-| **网络通信** | Wi-Fi, MQTT (信令), UDP (音频, AES-CTR 加密) |
-| **音频** | I2S 麦克风 (INMP441, 16kHz Mono) + I2S 功放 (MAX98357A) |
-| **音频编码** | Opus 上行 (esp\_audio\_codec, 60ms 帧, AES-CTR 加密), Opus 下行解码 |
-| **加密** | AES-CTR via mbedTLS (ESP-IDF 内置) |
-| **显示屏** | ST7789 TFT 1.54" 240×240 (SPI, 80MHz) |
-| **UI 框架** | LVGL v8.x |
-| **语音前处理** | ESP-SR AFE (NSNet2 降噪 + VAD 语音活动检测) |
-| **语音唤醒** | ESP-SR WakeNet9 (离线, "嗨莉莉" / Hi Lily, 阈值 0.5) |
-
-## 代码结构
-
+控制平面：终端 <-> MQTT <-> 服务端
+启动入口：终端 -> HTTP 注册/鉴权/OTA
 ```
-hilily-esp32/
+
+## 当前能力
+
+- ESP32-S3 双核 FreeRTOS 应用，音频和 UI 大任务优先使用 PSRAM。
+- 16 kHz 常开麦克风管线，支持 ESP-SR AEC 和 NSNet2 降噪。
+- 使用量化 TFLite Micro 模型在本地识别 “Hi Daisy”。
+- 16 kHz 单声道 Opus 上下行，每帧 60 ms。
+- MQTT 控制通道和 AES-CTR 加密 UDP 音频通道。
+- 配合服务端 Silero VAD，在 TTS 播放期间支持语音打断。
+- 按键打断会先对当前音频帧淡出，再清空待播放队列。
+- 连续对话和长录音分段上传。
+- ST7789/LVGL 界面，显示状态、字幕、波形、Wi-Fi、时间、电池、Overlay 和动态表情。
+- Captive Portal Wi-Fi 配网，最多保存 3 个热点，支持漫游和保存密码复用。
+- 设备注册、激活码 onboarding、持久化设备 token 和动态 MQTT 凭据。
+- 本地持久化提醒、闹铃、低电上报、远程设置和双分区 OTA。
+- 提供 QEMU mock，可在没有真机时进行设备侧开发。
+- `frontend/` 下提供可选的 React DAISY 图书搜索测试界面。
+
+## 硬件与软件
+
+| 项目 | 当前配置 |
+|---|---|
+| 主控 | ESP32-S3-N16R8，双核 240 MHz |
+| 存储 | 16 MB Flash，8 MB Octal PSRAM |
+| 板型 | `zhengchen-1.54tft-wifi` |
+| 显示屏 | ST7789，1.54 英寸，240 x 240，SPI 80 MHz |
+| 麦克风 | INMP441，I2S，16 kHz 单声道 |
+| 功放 | MAX98357A，I2S |
+| USB 转串口 | CH340K |
+| 开发框架 | ESP-IDF 5.3 及以上；最近构建元数据使用 5.5.3 |
+| UI | LVGL 8.4 |
+| 音频编解码 | `espressif/esp_audio_codec ~2.4.1` |
+| 音频前端 | `espressif/esp-sr ~2.3.0` |
+| 唤醒推理 | TFLite Micro + ESP-NN + micro-speech-features |
+| OTA 上报固件版本 | `1.2.0` |
+
+### 引脚映射
+
+| 功能 | GPIO |
+|---|---:|
+| LCD MOSI / SCLK / CS / DC / RST / 背光 | 41 / 42 / 21 / 40 / 45 / 20 |
+| 扬声器 DOUT / BCLK / LRCK | 7 / 15 / 16 |
+| 麦克风 SD / WS / SCK | 6 / 4 / 5 |
+| BOOT / 唤醒按键 | 0 |
+| 音量加 / 音量减及录音测试 | 10 / 39 |
+| 电池 ADC | 1 |
+
+## 运行架构
+
+### 启动与联网流程
+
+```text
+上电
+  -> 初始化 NVS、设置和 OTA 状态
+  -> 初始化板级硬件、显示、电池、音频、按键和提醒
+  -> 先初始化 Wi-Fi，为 AFE 保留足够内部 RAM
+  -> 初始化 AEC/NS 和 Daisy 唤醒模型
+  -> 连接已保存 Wi-Fi，或进入配网
+  -> 探测 HTTP 服务端
+  -> 没有 device_token 时执行注册和激活
+  -> 鉴权并取得 MQTT 凭据
+  -> 连接并订阅 MQTT
+  -> 发送 hello(features.aec=true)
+  -> 接收 UDP 地址、AES key/nonce、时区和音频参数
+  -> 进入 idle 并启用本地唤醒
+```
+
+应用只有在 MQTT 真正连接后才进入 `idle`，避免控制通道未就绪时启动录音并导致 `listen` 消息发送失败。
+
+### 设备状态
+
+状态机包括 `starting`、`wifi_connecting`、`idle`、`listening`、`thinking`、`speaking`、`reminding` 和 `error`。服务端通过 `state_change` 驱动对话状态，终端在每次状态转换时应用对应的音频和 UI 行为。
+
+支持的表情包括 `neutral`、`happy`、`sad`、`comfort`、`surprise`、`thinking`、`listening` 和 `reminding`。服务端可同时下发 0.0 到 1.0 的 `intensity`。
+
+### 主要任务
+
+| 任务 | Core | 优先级 | 职责 |
+|---|---:|---:|---|
+| `audio_in` | 1 | 10 | 常开麦克风采集 |
+| `afe_proc` | 1 | 8 | AEC 和降噪 |
+| `audio_out` | 1 | 10 | 音频解码和扬声器输出 |
+| `opus_enc` | 0 | 2 | 60 ms Opus 编码 |
+| `mww_daisy` | 0 | 2 | 本地唤醒推理 |
+| `udp_rx` | 0 | 11 | UDP 接收和解密 |
+| `audio_wr` | 0 | 8 | 下行音频队列转发 |
+| `msg_router` | 0 | 5 | MQTT JSON 路由 |
+| `ui` | 0 | 5 | LVGL 渲染和动画 |
+
+大任务栈和音频队列使用 PSRAM，尽量为 Wi-Fi 和实时驱动保留内部 SRAM。
+
+## 音频管线
+
+### 上行链路
+
+```text
+INMP441 32-bit I2S
+  -> 右移 12 位并饱和转换为有符号 16-bit PCM
+  -> ESP-SR AFE MR 模式：麦克风 + 软件扬声器参考
+  -> AEC_MODE_VOIP_LOW_COST
+  -> NSNet2，缺失时回退 WebRTC NS
+  -> 16 kHz 单声道 Opus，960 samples / 60 ms，VBR，关闭 DTX
+  -> UDP 包头 -> AES-CTR 加密载荷 -> 服务端
+```
+
+待机时麦克风 I2S 仍保持工作，使唤醒模型可以持续接收音频。当前实现关闭了 ESP-SR VAD 和 WakeNet。本地使用有界 RMS 检测辅助自动停止录音，服务端使用 Silero VAD 检测播放期间的语音打断。
+
+### 唤醒词
+
+固件嵌入的模型为 `main/models/daisy_stream_state_internal_quant.tflite`。模型通过短连续队列接收 AEC/NS 处理后的 16 kHz PCM。当前部署参数为：
+
+- Tensor 输入/输出：`int8[1,3,40]` 到 `uint8[1,1]`。
+- 30 ms 特征窗口，10 ms 步长。
+- 5 次结果滑动窗口。
+- 概率阈值：0.97。
+- 只有应用真正 idle 且扬声器排空后才启用推理。
+
+模型没有随附权威 microWakeWord manifest，因此量产前仍需在真实外壳和使用环境中测量 FAR/FRR 并完成参数校准。
+
+### 下行链路
+
+```text
+UDP 数据包
+  -> 序号检查 -> AES-CTR 解密
+  -> PSRAM 消息路由和下行队列
+  -> 5 帧启动水位
+  -> Opus 解码或 PCM 路径
+  -> 二次曲线软件音量
+  -> 16-bit 单声道转 32-bit I2S
+  -> MAX98357A 扬声器
+```
+
+收到 `tts.end` 后，终端会排空队列，而不是立即停止播放。每个新的 `tts.start` 都会重置结束标志，避免多段回复被前一段的 drain 提前截断。播放时，经过音量缩放的 PCM 还会写入软件 AEC 参考通道。
+
+### 对话与打断
+
+- Daisy 唤醒后先播放本地语音确认，发送 `listen.detect`，再进入自动连续对话。
+- idle 状态短按 BOOT 会启动自动连续对话。
+- 检测到有效语音后，本地 RMS 静音持续 1.5 秒会发送 `listen.stop`。
+- TTS 完全排空后等待 500 ms，让扬声器余振衰减，再重新监听。
+- 录音超过 30 秒时，可在自然停顿处发送 `listen.segment`。
+- 播放期间按 BOOT 会发送 `abort`，淡出当前帧、清空待播放音频并进入 listening。
+- speaking 状态仍持续上传 AEC 后音频，由服务端判断语音打断。
+
+## 网络协议
+
+### 当前地址
+
+| 通道 | 当前值 |
+|---|---|
+| HTTP 启动入口/OTA | `http://4.197.40.220:8000` |
+| MQTT | 由 `/api/v1/device/auth` 返回；当前部署预期端口 `1884` |
+| UDP 音频 | 由 MQTT `hello` 返回；当前部署预期端口 `8765` |
+| 本地配网 | `http://192.168.4.1` |
+
+ESP32 不直接访问 Azure OpenAI、Azure Speech 或 Translator。这些 provider 和密钥只属于服务端部署。
+
+### HTTP 启动流程
+
+1. `POST /api/v1/device/register`，提交小写 `mac_address`。
+2. `GET /api/v1/device/register/status?mac=...`，直到激活并取得 `device_token`。
+3. `POST /api/v1/device/auth`，提交 `mac_address` 和 `device_token`。
+4. 鉴权后以及每小时调用 `GET /api/v1/ota/check?device_id=...&current_version=1.2.0`。
+
+鉴权响应包含 broker URI、client ID、用户名/密码、上下行 topic 和过期信息。MQTT topic 通常为 `device/{mac}/up` 和 `device/{mac}/down`。
+
+### MQTT 消息
+
+终端发往服务端：
+
+| Type | 用途 |
+|---|---|
+| `hello` | 协商能力和 UDP 通道 |
+| `listen` | `start`、`detect`、`segment` 和 `stop` 生命周期 |
+| `abort` | 按键打断 |
+| `goodbye` | 结束对话 |
+| `client_pong` | 回复服务端心跳 |
+| `reminder_triggered` | 本地提醒已触发 |
+| `low_battery` | 已验证的低电快照 |
+
+服务端发往终端：
+
+| Type | 用途 |
+|---|---|
+| `hello` | UDP 会话、音频参数和时区 |
+| `state_change` | 对话状态；这是当前唯一有效的状态消息名 |
+| `emotion_update` | 表情和强度 |
+| `tts` | TTS `start` 和 `end` 生命周期 |
+| `audio_meta` | PCM/Opus 格式元数据 |
+| `stt` | 显示在屏幕上的识别文本 |
+| `server_ping` | 心跳请求 |
+| `config` | 音量、亮度和时区 |
+| `ota` | 远程固件更新请求 |
+| `reminder_created`、`reminder_cancelled`、`reminder_notify` | 提醒同步 |
+| `end_dialogue` | 关闭连续对话 |
+| `error` | 服务端错误信息 |
+
+### UDP 数据包
+
+```text
+| type 1 B | flags 1 B | payload_len 2 B | ssrc 4 B |
+| timestamp 4 B | sequence 4 B | 加密 Opus 载荷 |
+```
+
+16 字节网络字节序包头同时作为每包 AES-CTR counter 输入。sequence 提供基础旧包过滤。AES-CTR 不验证载荷完整性，相关风险见“当前限制”。
+
+## Wi-Fi 配网
+
+终端在 NVS 中最多保存 3 组 SSID 和密码。
+
+- 手动配网前始终先尝试已保存网络。
+- 初次启动时每个热点快速重试 2 次，所有已保存网络都失败后才进入配网。
+- 运行时断线使用更长的指数退避重连。
+- 每 10 秒检查 RSSI；连续 3 次低于 -75 dBm 后扫描，候选热点至少强 10 dB 才漫游。
+- 配网会建立开放热点 `HiLily-XXXX`，Captive Portal 地址为 `192.168.4.1`。
+- 配网页不要求 PIN。
+- 对已有 SSID 提交空密码会复用保存的密码。
+- 只有保存密码失效或用户主动修改时才需要输入新密码。
+- 已连接时长按 BOOT 只显示设备 IP，不会重新打开配网。
+- 未连接时长按 BOOT 会先重试已保存网络，仍失败后才进入设置。
+
+首次配网步骤：
+
+1. 手机连接 `HiLily-XXXX`。
+2. 使用自动弹出的配网页，或打开 `http://192.168.4.1`。
+3. 扫描新网络或选择已保存项目。
+4. 保存凭据，并在页面提示后重启。
+
+## 显示、电池、提醒与 OTA
+
+- LVGL 显示动态表情、监听波形、字幕、时间、Wi-Fi、五格电池以及全屏状态 Overlay。
+- 电池读数不在 2500-5000 mV 范围时直接丢弃。监控任务丢弃 5 个预热样本，使用 5 点中值，并要求连续 3 次低电才上报。
+- 当前电量曲线将 3000 mV 映射为 0%，4200 mV 映射为 100%；最终分压比例和曲线仍需真机校准。
+- 最多 10 条提醒保存到 NVS，每分钟扫描一次。到期后播放本地闹铃并通知服务端。
+- OTA 在鉴权后检查一次，之后每小时检查。固件写入非当前的 3 MB 应用分区，并支持回滚。
+
+## 仓库结构
+
+```text
+hiDaisy-esp32/
 ├── main/
-│   ├── main.cc               # 入口: app_main()
-│   ├── application.cc/h      # 应用框架: FreeRTOS 任务启动、事件循环、配网/状态协调
-│   ├── device_state.h        # 设备状态 & 情绪枚举定义
-│   ├── state_machine.cc/h    # 状态机: 状态流转 + 情绪回调 (含 intensity)
-│   ├── msg_router.cc/h       # MQTT JSON 消息路由与分发
-│   │
-│   ├── mqtt_client.cc/h      # MQTT 客户端: HTTP 认证、broker 连接、JSON 发布/订阅
-│   ├── udp_client.cc/h       # UDP 音频客户端: AES-CTR 加解密 + FreeRTOS 接收任务
-│   ├── ws_client.cc/h        # WebSocket 客户端 (遗留，保留供参考)
-│   │
-│   ├── display_manager.cc/h  # LVGL 初始化、UI 任务、状态栏、开机/配网浮层
-│   ├── face_renderer.cc/h    # 参数化机器人表情: 渲染引擎 + 30fps 动画
-│   │
-│   ├── audio_service.cc/h    # I2S 采集/播放、Opus 编解码 (esp_audio_codec)、Jitter Buffer
-│   ├── afe_processor.cc/h    # ESP-SR AFE 音频前处理: NSNet2 降噪 + VAD + WakeNet9 唤醒词
-│   ├── wifi_manager.cc/h     # Wi-Fi 连接管理、认证页配网、网页配置、NTP 时间同步
-│   │
-│   ├── button_manager.cc/h   # 物理按键 (GPIO0) 管理与防抖
-│   ├── battery.cc/h          # 电池 ADC 读取与电量监控
-│   ├── wake_word.cc/h        # ESP-SR 唤醒词检测 (遗留，已由 afe_processor 替代)
-│   ├── reminder_manager.cc/h # 定时提醒管理器
-│   │
-│   ├── board.cc/h            # 硬件 BSP: SPI 总线、外设初始化
-│   ├── pin_config.h          # GPIO 引脚定义
-│   └── CMakeLists.txt        # 编译配置
-│
-├── docs/
-│   ├── PRD_ESP32_Architecture.md   # 产品需求文档
-│   └── API_SPECIFICATION.md        # 设备-服务端通信协议
-│
-├── partitions.csv            # 分区表 (NVS, OTA, app, model SPIFFS)
-├── sdkconfig.defaults        # 核心配置 (PSRAM, LVGL, ESP-SR NSNet2 等)
-└── tests/                    # 测试
+│   ├── application.*              应用生命周期和事件循环
+│   ├── audio_service.*            I2S、Opus、缓冲、播放、AEC 参考
+│   ├── afe_processor.*            ESP-SR AEC 和降噪
+│   ├── micro_wake_word.*          Daisy TFLite Micro 推理
+│   ├── hilily_mqtt_client.*       HTTP onboarding/鉴权和 MQTT 客户端
+│   ├── udp_client.*               加密 UDP 音频通道
+│   ├── msg_router.*               MQTT JSON 和 UDP 音频路由
+│   ├── wifi_manager.*             保存网络、漫游、配网页和 NTP
+│   ├── display_manager.*          LVGL 显示和 Overlay
+│   ├── face_renderer.*            参数化动态表情
+│   ├── battery.*                  ADC 滤波和低电快照
+│   ├── reminder_manager.*         持久化提醒调度
+│   ├── ota_manager.*              双分区 OTA
+│   ├── qemu_mock/                 硬件和网络 mock
+│   ├── models/                    嵌入式 Daisy 唤醒模型
+│   └── assets/                    嵌入式本地音频资源
+├── docs/                           协议、架构、OTA 和项目报告
+├── notes/                          技术排查和已解决问题
+├── tests/                          固件源码级检查
+├── scripts/qemu_run.sh             独立 QEMU 构建和运行脚本
+├── frontend/                       DAISY 图书搜索测试界面
+├── partitions.csv                  16 MB Flash 分区表
+├── sdkconfig.defaults              真机默认配置
+├── sdkconfig.defaults.qemu         QEMU 默认配置
+├── flash.sh                        适配手动复位的烧录脚本
+└── monitor.sh                      自动重连串口监控和日志脚本
 ```
 
-## 通信架构
+## 编译
 
-### 连接流程 (MQTT + UDP)
+### 环境要求
 
-```
-Wi-Fi 连接
-  → HTTP POST /api/v1/device/auth        获取 MQTT Broker 凭据
-  → MQTT Connect (broker 地址/用户/密码)
-  → MQTT Publish {"type":"hello"}         触发服务端会话协商
-  → MQTT Receive hello reply (UDP 地址 + AES 密钥)
-  → UDP Connect + AES-CTR 初始化
-音频上行: I2S 采集 → AFE 降噪 (NSNet2) → Opus 编码 (60ms/帧) → AES-CTR 加密 → UDP 发送
-音频下行: UDP 收包 → AES-CTR 解密 → Opus 解码 (16kHz) → Jitter Buffer → I2S 播放
-控制信令: MQTT device/{mac}/up (上行) / device/{mac}/down (下行)
-```
+- ESP-IDF 5.3 及以上；当前记录的构建环境为 5.5.3。
+- ESP-IDF Python 环境，并允许下载 managed components。
+- ESP-IDF 安装提供的 Git、CMake 和 Ninja。
 
-### 消息类型
-
-**MQTT 上行 (device → server)**:
-`hello` · `start_dialogue` · `stop_dialogue` · `interrupt` · `client_pong`
-
-**MQTT 下行 (server → device)**:
-`hello` (含 UDP 参数) · `state_change` · `asr_result` · `emotion_update` · `reminder_notify` · `server_ping` · `error`
-
-**UDP 音频包格式** (16 字节头 + AES-CTR 加密 Opus 载荷):
-```
-| type 1B | flags 1B | payload_len 2B | ssrc 4B | timestamp 4B | seq 4B | [encrypted opus] |
-```
-
-## 动态表情系统
-
-设备端通过 `FaceRenderer` 实现完全计算生成的参数化机器人表情，无需任何图片资源：
-
-- **造型**: 圆角矩形眼睛 + 嘴巴，女性化 kawaii 风格 (睫毛 + 圆形腮红)
-- **6 种情绪**: neutral / happy / sad / comfort / surprise / thinking
-- **情绪强度**: 服务端通过 MQTT `emotion_update` 消息下发情绪类型 + `intensity` (0.0–1.0)，支持渐变混合
-- **30fps 动画**: 眨眼 (随机间隔)、呼吸 (正弦波微移)、水平漂移 (随机目标)
-- **平滑过渡**: 所有参数变化通过 lerp 插值 (系数 0.18)，约 500ms 到达目标值
-
-情绪数据流:
-```
-Server → MQTT → MsgRouter → StateMachine → DisplayManager → FaceRenderer
-         (emotion_update JSON)              (SetEmotion)    (SetTargetEmotion)
-```
-
-## 语音处理管线
-
-设备端通过 ESP-SR AFE (Audio Front-End) 框架构建统一的音频前处理管线：
-
-### 上行链路 (采集 → 服务端)
-```
-INMP441 麦克风 (I2S, 16kHz/32-bit Mono)
-  → CaptureTask: 32→16bit 转换 (>>12, 饱和裁剪)
-  → AfeProcessor: AFE(VC) 管线
-    ├─ NSNet2 神经网络降噪 (单通道, 无 AEC)
-    ├─ VAD 语音活动检测 → Application 回调
-    └─ WakeNet9 唤醒词检测 ("嗨莉莉", 阈值 0.5)
-  → OpusEncodeTask: esp_audio_codec Opus 编码 (60ms 帧, 16kHz)
-  → UdpClient: AES-CTR 加密 → UDP 发送
-```
-
-### 下行链路 (服务端 → 播放)
-```
-UDP 收包 → AES-CTR 解密
-  → MsgRouter: 音频包分发至下行队列
-  → PlaybackTask: Jitter Buffer (预缓冲 5 帧)
-    → esp_audio_codec Opus 解码 (16kHz/60ms)
-    → I2S 输出 (MAX98357A 功放)
-```
-
-### 双监听模式
-
-| 模式 | 触发方式 | 停止条件 |
-|------|---------|---------|
-| **自动 (唤醒词)** | "嗨莉莉" 离线检测 | VAD 静音 ≥1.5s 自动停止，无需按键 |
-| **手动 (按键)** | GPIO0 按键 | 下一次按键停止 — 适合长时间独白 |
-
-### 分段上传 (长对话)
-
-对于较长的录音（如按键模式长时间讲话），固件以分段方式发送音频而非一次性发送全部数据：
-
-- 超过 30 秒后，遇到 ≥1s VAD 静音时触发**分段边界**
-- ESP32 通过 MQTT 发送 `{"type":"listen","state":"segment","segment":N}`
-- 服务端对每段分别执行 ASR，合并转录结果
-- 最终 `listen(stop)` 将完整多段文本统一发给 LLM 处理
-- 防止 Groq ASR 60s 超时，同时保留完整对话上下文
-
-### 唤醒词与 VAD
-- **Always-on 麦克风**: CaptureTask 持续读取 I2S 并喂入 AFE，支持随时唤醒
-- **WakeNet9 模型**: `wn9_hilili_tts` (嗨莉莉)，DET_MODE_90 + 阈值 0.5，适配多种口音
-- **VAD 回调**: 实时通知 Application 语音/静音状态，用于自动停止录音
-- **模型存储**: SPIFFS 分区 (`model`, 1MB @ 0x610000)
-
-## 核心特性
-
-1. **FreeRTOS 多任务架构**
-   - Audio 采集/播放 (Core 1)、AFE 处理 (Core 1)、Opus 编码 (Core 0)、UI 渲染 (Core 0)、网络通信等各跑独立 Task
-   - 任务间严禁直接调用，通过 FreeRTOS Queue 和 Mutex 通信
-
-2. **MQTT + UDP 双通道通信**
-   - MQTT: JSON 控制信令 (`hello`, `start_dialogue`, `emotion_update`, `server_ping` 等)
-   - UDP: AES-CTR 加密 Opus 音频流 (低延迟、低开销)
-
-3. **ESP-SR 音频前处理 (AFE)**
-   - NSNet2 神经网络降噪: 单麦克风 (M 格式)，无 AEC (本板无硬件参考回路)
-   - VAD 语音活动检测: 实时语音/静音状态回调
-   - WakeNet9 唤醒词: "嗨莉莉" 离线检测 (阈值 0.5，适配多种口音)
-   - Always-on 麦克风: 全时段监听，支持随时唤醒
-
-4. **全双工打断 (Barge-in)**
-   - 按键/唤醒词触发后 100ms 内清空音频 Buffer 停止发声
-   - 立即通过 MQTT 上报 `interrupt` 指令
-
-5. **流式音频抗抖动 (Jitter Buffer)**
-   - 65KB 环形缓冲区，预缓冲 5 帧后开始播放，抵抗弱网环境下的音频撕裂
-
-6. **Opus 编解码 (esp\_audio\_codec)**
-   - 上行: 16kHz/60ms 帧/自动码率/DTX+VBR，替代已弃用的 micro-opus
-   - 下行: 16kHz/60ms 帧，服务端 TTS 流式解码（含 carry-over buffer 防帧对齐丢帧）
-
-7. **双监听模式**
-   - 唤醒词模式: VAD 静音自动停止
-   - 按键模式: 两次按键之间持续录音，支持分段上传
-
-8. **OTA 固件远程升级**
-   - 启动时 + 每小时自动检查服务端最新版本 (`GET /api/v1/ota/check`)
-   - 语义化版本比较 (如 1.2.0 > 1.1.0)
-   - 下载过程中屏幕全屏显示进度 (Overlay + 百分比)
-   - 下载失败自动重试 3 次；最终失败恢复正常运行
-   - 支持服务端 MQTT 推送 OTA：`{"type": "ota", "url": "...", "version": "..."}`
-   - 双 OTA 分区 (ota_0 / ota_1, 各 3MB)，自动回滚保护
-   - 管理员固件管理：上传 `POST /api/v1/ota/upload`，下载 `/api/v1/ota/firmware/{version}`
-
-9. **WiFi 热点配网**
-   - 首次启动或没有已保存 WiFi 时，会重启进入专用配网热点，而不是在运行中直接切 WiFi 模式
-   - 手机连接 `HiLily-XXXX` 后会优先弹出认证页；如果系统没有自动弹出，可手动打开 `http://192.168.4.1`
-   - 设备屏幕会持续显示配网引导浮层，包含热点名，直到 WiFi 配置成功
-   - 网页支持扫描附近 WiFi、保存/删除设备内已保存网络，设备侧最多保存 3 条记录
-
----
-
-## WiFi 配网流程
-
-HiLily 对首次配网，以及已保存 WiFi 都连接失败的情况，使用专用 AP 配网启动路径。
-
-### 何时进入配网
-
-- 设备里没有任何已保存 WiFi
-- 设备里有已保存 WiFi，但所有已保存热点都连接失败
-- 待机时长按 `BOOT` 键 3 秒会先尝试连接已保存 WiFi；只有保存热点连接失败时才进入配网热点
-
-### 用户操作流程
-
-1. 屏幕会显示持续常驻的配网提示，包含热点名。
-2. 手机连接热点 `HiLily-XXXX`。
-3. 系统通常会自动弹出配网页；如果没有弹出，手动访问 `http://192.168.4.1`。
-4. 可以直接使用已保存网络、扫描附近 WiFi，或手动输入 SSID/密码。对已保存 SSID 留空密码会复用设备内保存的密码。
-5. 保存网络。首次配网时，保存第一条网络后网页会提示重启。
-
-### 说明
-
-- 配网时使用 `WIFI_MODE_APSTA`，这样热点网页可用的同时，`/scan` 也能主动扫描附近 AP。
-- 页面里的 `Saved Networks (stored on device)` 指的是设备内已保存的网络，不是实时扫描结果。
-- 设备最多保存 3 条 WiFi 记录；在网页里删除后，对应凭据也会从 NVS 中移除。
-- 选择已保存网络会复用保存的密码；只有旧密码失效时才需要输入新密码。
-- 设备已经连上 WiFi 时，长按不会打开配网热点。
-- 配网页会直接进入 WiFi 设置页面，不再要求输入 PIN。
-- 配网页依赖 DNS 劫持和通配 HTTP 重定向，兼容常见手机系统的 captive portal 探测请求。
-
-## 编译与烧录
-
-### 1. 环境准备
-
-安装 [ESP-IDF v5.x](https://docs.espressif.com/projects/esp-idf/zh_CN/latest/esp32s3/get-started/index.html)，然后:
-```bash
-source $HOME/.espressif/v5.5.3/esp-idf/export.sh
-```
-
-### 2. 编译
+### 真机固件
 
 ```bash
-cd hilily-esp32
+cd hiDaisy-esp32
+. "$IDF_PATH/export.sh"
 idf.py set-target esp32s3
 idf.py build
 ```
 
-### 3. 烧录
+生成的应用固件为 `build/hilily-esp32.bin`。`main/CMakeLists.txt` 会将 Daisy TFLite 模型和本地唤醒确认音频嵌入固件。
 
-> 本开发板不支持自动进入下载模式 (DTR 未连接 GPIO0)，需手动操作：
-> **按住 BOOT → 按一下 RST → 松开 BOOT**
-
-```bash
-cd build
-python -m esptool --chip esp32s3 -p /dev/cu.wchusbserial1130 -b 460800 --before no_reset \
-  write_flash @flash_args
-```
-
-### 4. 串口监控
+### QEMU
 
 ```bash
-idf.py -p /dev/cu.wchusbserial1130 monitor
+./scripts/qemu_run.sh build
+./scripts/qemu_run.sh run
 ```
 
-## 配合 Server 端联调
+需要虚拟 framebuffer 时将 `run` 改为 `graphics`。QEMU 使用 board、Wi-Fi、电池、音频、显示、MQTT 和 UDP mock，不能复现真实 AEC、射频、ADC 和声学效果。
 
-硬件端开发强依赖于 [HiLily Server 接口规范](https://github.com/sarahliuakl/hilily-server/blob/main/docs/API_SPECIFICATION.md)。在进行 MQTT 握手或 UDP 音频流测试时，请确保两端的 JSON Schema 与 UDP 包头规范完全对齐。
+## 烧录与串口监控
 
-服务端仓库: [sarahliuakl/hilily-server](https://github.com/sarahliuakl/hilily-server)
+本板不能可靠地通过 DTR/RTS 自动进入或退出下载模式，必须手动操作：
 
-## 团队
+1. 按住 BOOT。
+2. 按下并松开 RST。
+3. 松开 BOOT。
+4. 使用 `--before no_reset --after no_reset` 开始烧录。
+5. 烧录完成后手动按 RST。
 
-- **Alex (Hardware Lead)**: 前版本硬件方案设计与交付
-- **Sarah (Product Lead)**: 产品需求与 API 协议设计、项目管理；当前版本 ESP32 固件全栈开发
+macOS 辅助脚本：
+
+```bash
+./flash.sh /dev/cu.wchusbserial1130
+./monitor.sh /dev/tty.wchusbserial1130 0
+```
+
+`flash.sh` 当前包含开发者本机的 ESP-IDF 路径，在其他机器使用前需要修改其中的 `IDF_PATH`。
+
+Windows ESP-IDF 终端示例：
+
+```powershell
+Set-Location build
+python -m esptool --chip esp32s3 -p COM3 -b 460800 --before no_reset --after no_reset write_flash '@flash_args'
+Set-Location ..
+```
+
+打开 COM3 前先关闭其他串口监视器。如果 ROM 显示 `DOWNLOAD(USB/UART0) waiting for download`，说明设备仍处于下载模式；成功烧录后松开 BOOT 并按 RST。
+
+## DAISY 图书搜索测试前端
+
+可选 React/Vite 界面调用 `GET /api/books/search`，显示 DAISY 图书卡片，并测试浏览器语音命令和服务端音频响应。
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+代理配置和响应 schema 见 [frontend/README.md](frontend/README.md)。
+
+## 文档
+
+- [终端项目报告](docs/HILILY_TERMINAL_PROJECT_REPORT.md)：当前架构、联调契约、风险和验收清单。
+- [设备/服务端 API 规范](docs/API_SPECIFICATION.md)：历史共享协议文档，其中部分内容仍描述旧 WebSocket 链路。
+- [ESP32 架构 PRD](docs/PRD_ESP32_Architecture.md)：产品和目标架构。
+- [OTA 管理员指南](docs/OTA_ADMIN_GUIDE.md)：服务端固件发布流程。
+- [英文用户手册](USER_MANUAL_EN.md)：用户操作和安全说明。
+- [技术笔记](notes/)：问题排查和实现决策。
+
+## 当前限制
+
+- 当前公网 HTTP 地址和预期 MQTT 部署仍使用明文 `http://` 和 `mqtt://`。生产部署应使用稳定域名、HTTPS、MQTTS 和证书校验。
+- UDP 音频使用 AES-CTR，但没有认证 tag。生产加固应使用 AEAD，或增加包含防重放关联数据的 MAC。
+- OTA 当前没有校验响应中的 MD5，也没有签名固件 manifest。正式发布前应评估 TLS、SHA-256/签名验证和 Secure Boot。
+- 顶层 `CMakeLists.txt` 的项目版本为 `1.0.0`，`OtaManager` 上报 `1.2.0`，应改为同一个版本来源。
+- MQTT 凭据的 `expires_in` 已解析，但没有主动刷新调度。
+- 唤醒模型缺少权威特征 manifest，仍需进行外壳相关的 FAR/FRR 测试。
+- 电池 ADC 连线、分压比例和百分比曲线仍需最终硬件校准。
+- `tests/test_firmware.py` 仍包含部分旧 WebSocket 实现的断言，不能完整代表当前 MQTT/UDP 固件质量。
+
+## 服务端联调清单
+
+端到端测试应按以下顺序进行：
+
+1. Wi-Fi、DHCP、NTP 和 HTTP 可达性。
+2. 注册、激活、token 持久化和鉴权。
+3. MQTT 连接、topic、`hello`、心跳和状态消息。
+4. 可公网访问的 UDP 地址、keepalive、AES 参数和 Opus 解码。
+5. 多段 TTS 播放和 `tts.start`/`tts.end` 时序。
+6. 按键打断和语音打断。
+7. 长录音分段合并。
+8. 提醒同步和本地触发。
+9. OTA 成功、下载中断、无效镜像和回滚。
+10. Wi-Fi、MQTT 和 UDP 断开恢复，且不产生重复任务或资源泄漏。
+
+服务端和固件必须严格对齐 JSON schema、16 字节 UDP 包头、网络字节序、16 kHz 单声道音频和 60 ms Opus 帧。
