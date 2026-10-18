@@ -1,0 +1,27 @@
+menu "HiLily Configuration"
+
+    config HILILY_QEMU_MODE
+        bool "Enable QEMU emulation mode"
+        default n
+        help
+            When enabled, hardware peripherals (I2S, SPI LCD, GPIO, LEDC, WiFi)
+            are replaced with mock implementations for QEMU testing.
+            A UART test console is enabled for simulating button presses,
+            audio injection, and state inspection.
+
+    config HILILY_QEMU_MOCK_WIFI_CONNECTED
+        bool "Mock WiFi as always connected"
+        default y
+        depends on HILILY_QEMU_MODE
+        help
+            Simulate WiFi as always connected in QEMU mode.
+
+    config HILILY_QEMU_MOCK_BATTERY_PERCENT
+        int "Mock battery percentage"
+        default 85
+        range 0 100
+        depends on HILILY_QEMU_MODE
+        help
+            Fixed battery percentage to report in QEMU mode.
+
+endmenu
